@@ -1,0 +1,25 @@
+{
+  "name": "tempo",
+  "owner": {
+    "name": "tslater"
+  },
+  "metadata": {
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "tempo",
+      "source": "./",
+      "description": "Performance optimization workflow for Python/Django and TypeScript/Vue. Includes the /perf command with a 7-phase workflow, perf-analyzer and perf-reviewer agents, and a performance-hints skill with distilled reference material.",
+      "keywords": [
+        "performance",
+        "optimization",
+        "profiling",
+        "latency",
+        "back-of-envelope"
+      ],
+      "category": "development",
+      "skills": ["./skills/performance-hints"]
+    }
+  ]
+}

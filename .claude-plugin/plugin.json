@@ -1,0 +1,19 @@
+{
+  "name": "tempo",
+  "version": "0.1.0",
+  "description": "Performance optimization workflow for Python/Django and TypeScript/Vue - estimate first, measure always. Based on Jeff Dean and Sanjay Ghemawat's Performance Hints.",
+  "author": {
+    "name": "tslater"
+  },
+  "license": "MIT",
+  "keywords": [
+    "performance",
+    "optimization",
+    "profiling",
+    "latency",
+    "benchmarking",
+    "django",
+    "vue",
+    "back-of-envelope"
+  ]
+}
