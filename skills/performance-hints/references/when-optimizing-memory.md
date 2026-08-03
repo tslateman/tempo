@@ -1,40 +1,185 @@
 # When Optimizing Memory
 
-Allocation costs three ways: allocator time, construction/destruction, and cache dispersal - freshly allocated objects scatter across memory, so later traversal misses cache. Reducing allocations and choosing dense representations often beats micro-optimizing the computation.
+Allocation costs three ways: the allocator's time, the constructor and
+destructor, and the cache dispersal of the resulting objects. The third is the
+one people forget and often the largest.
 
-## Prefer contiguous, dense representations
+The goal is rarely "use less RAM." It is usually "touch less memory," because
+memory is 100x slower than L1 cache and a scattered heap turns every access into
+a cache miss.
 
-- Contiguous beats node-based: lists and arrays beat linked structures; in Python, a list of tuples beats a linked structure of objects, and numpy arrays beat lists of objects by an order of magnitude in both memory and traversal.
-- Columnar beats row-of-objects for bulk numeric work: numpy/pandas keep values contiguous and typed; a million Python floats in a list cost ~28 bytes each plus pointer, a float64 numpy array costs 8.
-- Downsize dtypes when ranges allow: int64 to int32/int16, float64 to float32, object strings to `category` for low-cardinality columns. Halving width halves memory traffic.
-- Indices over references: store an index into a shared list instead of a reference to the object, when building transient graphs or cross-references. Smaller, and serializes trivially.
+## Principles from the hardware up
 
-## Reduce per-object overhead
+**Contiguity beats indirection.** An array of values is one stream the prefetcher
+can follow. A list of pointers to objects is a random walk. In Python this means
+`array`, `bytes`, and numpy arrays over lists of objects; in TypeScript, typed
+arrays over arrays of records when the data is numeric and large.
 
-- `__slots__` or `@dataclass(slots=True)` removes the per-instance `__dict__`: substantial savings and faster attribute access for classes instantiated in the millions.
-- Tuples over dicts for fixed-shape records in hot paths; NamedTuple keeps names without dict overhead.
-- Separate hot from cold data: Django's `.only()` / `.defer()` and `.values_list()` avoid hydrating full model instances when the loop touches two fields. Hydrating a model instance costs far more than a tuple.
+The scale of this is easy to underestimate: a Python float in a list costs
+roughly 28 bytes plus a pointer, while the same value in a `float64` numpy array
+costs 8 bytes and sits next to its neighbours. Columnar beats row-of-objects by
+close to an order of magnitude for bulk numeric work, in both memory and
+traversal speed.
 
-## Reduce allocation count
+**Smaller is faster.** More elements per cache line means fewer misses. A numpy
+column downcast from `float64` to `float32`, or `int64` to `int32`, halves the
+bytes moved. Do this only where the range genuinely fits; a silent overflow is
+not a performance win.
 
-- Pre-size and build once: list comprehensions and `dict(...)` constructors allocate once; repeated `.append()` in a loop reallocates as the list grows. In TypeScript, `Array.from({length: n})` or a single `map` beats repeated `push` on large arrays.
-- Hoist allocations out of loops: buffers, compiled regexes (`re.compile` once, module level), date formatters, reused dicts.
-- Build strings with `"".join(parts)` or an f-string, never `+=` in a loop (quadratic copying). Same in TS: collect into an array and `join`.
-- Stream instead of materializing: generators, `QuerySet.iterator()`, and `StreamingHttpResponse` process rows one at a time. Use them for single-pass pipelines over large data; use a list when the data is reused, needs `len`, or is small.
-- Move, do not copy: pass references, slice with memoryview for bytes, avoid `list(x)` "just in case" copies.
+**Indices beat references.** A 4-byte index into a dense array beats an 8-byte
+pointer, and the target is likely already in cache because it sits next to its
+neighbours.
 
-## Layout for the cache (compiled/hot-path work)
+**Separate hot from cold.** Fields read on every iteration and fields read once
+should not share a cache line. Splitting a wide record into a hot narrow one plus
+a cold detail lookup is the data-layout version of Django's `.only()`.
 
-For numpy, native extensions, or very hot TS code, the original C++ guidance applies directly:
+**Pre-size when you know the size.** Growing a container reallocates and copies.
+Abseil reports pre-sizing removing 21% of the cost in one benchmark. In Python
+this matters most for numpy (`np.empty(n)` then fill) and for avoiding repeated
+concatenation.
 
-- Order fields to minimize padding; use smaller numeric types
-- Separate hot-read-only from hot-mutable fields (cache line behavior)
-- Small-size optimizations and arenas: batch many small objects into one allocation
+## Python
 
-## Priors, not measurements
+**`__slots__` removes the per-instance dict.** For a class instantiated in the
+millions this cuts memory substantially and speeds attribute access:
 
-Pre-sizing containers eliminated 21% of one benchmark's cost in the source material; treat that and any figure like it as a rough prior. Estimate the saving for your case with the latency table, then measure.
+```python
+class Point:
+    __slots__ = ("x", "y")
 
-## Sources
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+```
 
-- Performance Hints (memory representation, allocation sections): https://abseil.io/fast/hints.html
+For dataclasses, `@dataclass(slots=True)`. The trade is that you cannot add
+attributes dynamically, which is usually a feature.
+
+**Generators instead of lists** when the sequence is consumed once. Memory goes
+from O(n) to O(1) and the first result arrives immediately:
+
+```python
+def parse_lines(path):
+    with open(path) as fh:
+        for line in fh:
+            yield parse(line)
+```
+
+`list(parse_lines(path))` undoes this. So does any code that iterates twice.
+
+**Hoist allocations out of loops.** Building the same object every iteration
+pays construction and gives the allocator work:
+
+```python
+matcher = re.compile(PATTERN)
+for row in rows:
+    if matcher.match(row.name):
+        ...
+```
+
+Reuse a mutable buffer where the API supports it rather than allocating a fresh
+one per item.
+
+**Join, do not concatenate.** `s += x` in a loop is O(n^2) because each
+concatenation copies the whole accumulated string:
+
+```python
+parts = []
+for row in rows:
+    parts.append(format_row(row))
+body = "".join(parts)
+```
+
+**Sets and dicts for membership.** `x in some_list` is O(n). Build the set once
+outside the loop.
+
+**Tuples and `namedtuple` for fixed records** are smaller than dicts and hash
+cheaply. `dict` per row is the standard hidden memory cost in data pipelines.
+
+**`array` and `memoryview`** for homogeneous numeric data and for slicing bytes
+without copying. `memoryview(buf)[100:200]` is a view; `buf[100:200]` is a copy.
+
+## Django and large datasets
+
+**`.iterator()`** streams rows instead of materializing the result cache. Use it
+for any queryset large enough that the list would be uncomfortable. Note that it
+disables `prefetch_related` unless you pass `chunk_size` on a supported backend,
+and that iterating the queryset twice re-runs the query.
+
+**`.values()` and `.values_list()`** skip model instantiation entirely. For a job
+that reads four fields from five million rows, this is the difference between a
+model object graph and a stream of tuples:
+
+```python
+for order_id, status in Order.objects.values_list("id", "status").iterator():
+    ...
+```
+
+**`.only()` and `.defer()`** keep model instances but fetch fewer columns. The
+trap: touching a deferred field triggers a query per instance, converting a
+memory win into an N+1.
+
+**Bulk operations** move work from N round trips to one, and from N model
+lifecycles to one queryset:
+
+```python
+Order.objects.bulk_update(orders, ["status"], batch_size=1000)
+```
+
+`batch_size` matters. An unbounded bulk statement builds one enormous query and
+can exhaust memory on both sides.
+
+**`select_related` versus `prefetch_related`.** `select_related` joins and
+returns wider rows, so it trades bytes for round trips; good for a
+one-to-one or forward FK. `prefetch_related` runs a second query and joins in
+Python, so it trades memory for round trips; necessary for reverse and M2M
+relations. Neither is free, and applying both to a wide model can move more
+bytes than the N+1 they replaced.
+
+## numpy and pandas
+
+- Downcast dtypes where the range allows. `int64` to `int32` halves the column.
+- `category` dtype for low-cardinality string columns replaces per-row Python
+  strings with integer codes plus a small dictionary. On a column with a handful
+  of distinct values this is usually the single largest available win.
+- Prefer vectorized operations to `.apply()` with a Python function. `.apply()`
+  reintroduces the per-row interpreter cost the array layout exists to avoid.
+- `df.copy()` and chained indexing produce copies. Know which operations return
+  views.
+- Read only the columns you need: `usecols` on `read_csv`, column projection on
+  parquet.
+
+## TypeScript and the browser
+
+- Typed arrays (`Float32Array`, `Int32Array`) for large numeric datasets:
+  contiguous, no per-element object header, transferable to a worker without a
+  copy.
+- Object shape stability matters. Adding properties to an object after
+  construction, or constructing the same logical record with different key
+  orders, forces the engine to abandon its optimized hidden class.
+- `structuredClone` and JSON round trips are full copies. On a large object
+  either one can dominate the operation containing it.
+- Closures captured in long-lived handlers retain everything in scope. This is
+  the usual cause of a leak in a component that mounts and unmounts repeatedly.
+- Build large arrays in one pass. `Array.from({length: n}, fn)` or a single
+  `map` allocates once; repeated `push` reallocates as the array grows.
+- In Vue, `ref()` over a large array creates a deep reactive proxy over every
+  element. Use `shallowRef` when the value is replaced wholesale rather than
+  mutated in place, and `markRaw` for objects that should never be reactive.
+
+## What not to do
+
+- Do not add object pooling before you have evidence that allocation is the
+  dominant term. It usually is not, and a pool is a lifetime bug waiting to
+  happen.
+- Do not micro-tune a data structure that holds a hundred elements. Cache
+  effects are a large-n phenomenon.
+- Do not trade clarity for bytes without a measurement showing the bytes
+  mattered.
+
+---
+
+Source: Jeff Dean and Sanjay Ghemawat, "Performance Hints", memory
+representation and allocation reduction sections,
+https://abseil.io/fast/hints.html.

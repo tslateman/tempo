@@ -1,53 +1,102 @@
-# When Reviewing a Performance Change
+# When Reviewing Performance Changes
 
-Correctness first: an optimization that breaks behavior is worse than slow code. Then interrogate the performance claim itself - many optimizations optimize a path that was never hot.
+An optimization that breaks correctness is worse than the slow code it replaced,
+because it is fast, wrong, and now trusted. Review in three gates, in order.
+Nothing downstream matters until correctness passes.
 
-## Correctness checklist
+## Gate 1 - Correctness
 
-- Same outputs for same inputs, including empty, single-element, maximum-size, unicode, and timezone cases
-- Error handling intact: exceptions still surface; partial failures in batches are accounted for
-- Concurrency: caching, pooling, and parallelism introduce shared state - who synchronizes it?
-- Resource cleanup on all paths: clients closed, tasks awaited, files released
+- **Behavior preserved.** Same output for the same input, including ordering
+  where anything depends on it.
+- **Errors still propagate.** No new blanket `except`, no swallowed failure, no
+  default value substituted for an error. An exception at the point of failure
+  is worth more than a fallback that hides it.
+- **Edge cases.** Empty, one element, exactly at a batch boundary, null fields,
+  duplicates, unicode.
+- **Concurrency.** New shared state, changed transaction boundaries, ordering
+  assumptions that parallelism breaks.
+- **Cleanup.** Every long-lived client, connection, or file has a shutdown path.
+- **Side effects.** A per-row loop replaced by a bulk call may have been firing
+  signals, hooks, audit writes, or cache invalidations. Confirm those still
+  happen.
 
-## Common optimization bugs
+### Common optimization bugs
 
-| Optimization          | Common bug          | What to check                           |
-| --------------------- | ------------------- | --------------------------------------- |
-| Parallel I/O          | Lost error handling | try/except around the gathered tasks    |
-| Shared clients        | Connection leaks    | Shutdown cleanup, timeouts configured   |
-| Pre-sized collections | Off-by-one          | The size calculation                    |
-| Caching               | Stale data          | An invalidation strategy exists         |
-| Deferred computation  | Never computed      | The lazy value is actually awaited/read |
-| Bulk operations       | Partial failures    | Rollback or per-item error reporting    |
+| Optimization                    | Bug                                                    | Detection                                                                                    |
+| ------------------------------- | ------------------------------------------------------ | -------------------------------------------------------------------------------------------- |
+| `asyncio.gather`                | exceptions lost or misattributed                       | `return_exceptions=True` with results never inspected, or `False` with siblings left running |
+| `Promise.all`                   | fail-fast cancels nothing, siblings run unobserved     | partial success required but `allSettled` not used                                           |
+| Shared client                   | leak, no shutdown, wrong event loop                    | module-level client with no close; created before fork or before the loop                    |
+| `bulk_create`                   | `post_save` never fires, PKs unset, validation skipped | signal handlers that the loop used to trigger; `obj.pk` read after create                    |
+| `bulk_update`                   | `auto_now` fields stale                                | `updated_at` expected to move and does not                                                   |
+| `select_related` on nullable FK | inner join drops rows                                  | result count differs from before                                                             |
+| `select_related` chained        | wide joined rows cost more than the two queries did    | join width times row count against what the caller actually reads                            |
+| `prefetch_related`              | prefetch discarded, N+1 returns silently               | `.filter()`, `.exclude()`, or `.order_by()` on the related manager afterwards                |
+| `.only()` / `.defer()`          | deferred field touched, one query per instance         | attribute access outside the fetched set                                                     |
+| `.iterator()`                   | queryset consumed twice, prefetch disabled             | second iteration; prefetch expected but not honoured                                         |
+| `.values()`                     | model methods and properties no longer available       | downstream code calling a method on what is now a dict                                       |
+| Caching                         | stale reads                                            | no invalidation on the write path, no TTL                                                    |
+| Cache key                       | cross-tenant or cross-user leakage                     | key omits tenant, user, locale, or permission scope                                          |
+| `lru_cache`                     | unbounded growth, instance retained, mutable result    | cache on a method holding `self`; cached mutable returned by reference                       |
+| Deferred computation            | never forced, or computed twice                        | lazy value not awaited; no memo on the lazy path                                             |
+| Pre-sized container             | off-by-one                                             | size expression differs from the loop bound                                                  |
+| Fast path                       | diverges from the slow path                            | the two returning different results for the same input                                       |
+| Bulk endpoint                   | partial failure with no rollback or report             | atomicity assumed, not enforced                                                              |
+| Module-level mutable state      | cross-request contamination                            | dict or list at module scope mutated per request                                             |
+| `shallowRef`                    | nested mutation no longer triggers render              | a nested field mutated in place                                                              |
+| Debounce or throttle            | last event dropped                                     | no trailing invocation                                                                       |
+| Index added                     | write amplification, migration lock                    | high-write table, large row count, no `CONCURRENTLY`                                         |
+| Compression added               | CPU now dominates on a local path                      | compressing over localhost or an already-compressed payload                                  |
 
-## Stack-specific bugs
+## Gate 2 - Does it actually help?
 
-| Optimization              | Common bug                                                            | What to check                                                                       |
-| ------------------------- | --------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| asyncio.gather            | First exception cancels siblings, or errors vanish                    | return_exceptions choice matches intended semantics                                 |
-| Django cache              | Write path skips invalidation                                         | Every mutation of the cached data invalidates                                       |
-| prefetch_related          | Later .filter() on the related manager silently discards the prefetch | No .filter()/.exclude() on prefetched relations; use Prefetch(queryset=...) instead |
-| Promise.all               | Fail-fast aborts in-flight siblings                                   | Whether allSettled was the intended semantics                                       |
-| Module-level shared state | Mutation races under ASGI workers/threads                             | Module dicts or lists mutated per request                                           |
-| bulk_create/bulk_update   | Bypasses save() overrides and signals                                 | Whether signals or save() carried business logic                                    |
+Challenge the claim, not just the code.
 
-## Interrogating the claim
+- **Is it hot?** A 90% saving on code that runs once at startup saves nothing.
+- **Is it measured?** Find the numbers. If the change was validated by reading
+  the code, label the claim UNVERIFIED and say so. A saving nobody measured is a
+  hypothesis.
+- **Is the benchmark honest?** Warm cache for cold, unrealistic input size,
+  single run, setup inside the timed region, dead code eliminated, arms not
+  interleaved. See `when-measuring.md`.
+- **Did the cost move rather than vanish?** More memory, more connections,
+  larger payloads, more GC pressure, work pushed to another service, latency
+  traded away in a latency-sensitive path.
+- **Does it hold under load?** A pool of one is a serialization point. A cache
+  with a poor hit rate is pure overhead. A batch size tuned on ten rows may be
+  wrong at a million.
+- **Was the dominant term addressed?** Reducing a term that was 8% of the total
+  is churn, however satisfying the percentage on that term looks.
 
-1. **Is it a hot path?** Init code and admin-only paths rarely justify complexity
-2. **Is the size plausible?** Check the claimed saving against the latency table; a fix "saving" more time than the operation ever took is misattributed
-3. **Hidden costs?** Extra memory, cache pressure, lock contention, added dependency, complexity tax on every future reader
-4. **Under load?** Caches can thrash, pools can exhaust, batch sizes can exceed limits - the benchmark ran once, production runs concurrently
-5. **Was it measured?** Before-and-after numbers, on realistic data, with noise accounted for (see when-measuring.md). Unmeasured wins are unverified claims - say so in the review
+## Gate 3 - Maintainability
 
-## Maintainability
+- Can someone unfamiliar with this change modify it safely in six months?
+- Is the constraint that forced the non-obvious form recorded durably, in a test
+  name, a commit message, or a docstring stating the requirement?
+- Did the optimization leak into a public interface that is now hard to change?
+- Is there a regression test? An unprotected performance fix regresses. The
+  cheapest guard that would catch it: `assertNumQueries`, a benchmark
+  threshold, a payload-size assertion, a bundle budget.
+- Was the complexity worth it? Say plainly when it was not.
 
-- The optimized code should state its constraint where the code cannot show it ("hot path: called per row, avoid allocation")
-- If the measured win is small and the complexity large, recommend reverting - a 2% win rarely pays for opaque code outside a proven-hot library
+**Prefer the concise form.** When a simpler expression is also the faster one -
+comparing ISO-8601 strings directly instead of parsing to `datetime`, a set
+literal instead of a constructed set, a projection instead of fetching and
+discarding - the optimization should have made the code shorter. An optimization
+that made the code longer needs to justify the trade explicitly.
 
-## Verdict form
+## Reporting
 
-Change summary, correctness PASS/FAIL, claim vs evidence, issues by severity with file:line, then APPROVE / APPROVE WITH CHANGES / REJECT.
+Every finding needs a concrete failure scenario: the inputs and state that
+produce the wrong result. "This could be risky" is not a finding.
 
-## Sources
+Rank by severity and lead with the worst. Separate what must change from what
+you would prefer.
 
-- Performance Hints: https://abseil.io/fast/hints.html
+Do not manufacture findings to appear thorough. "Correct, measured, and
+maintainable" is a valid review outcome and the most useful one to receive.
+
+---
+
+Source: Jeff Dean and Sanjay Ghemawat, "Performance Hints",
+https://abseil.io/fast/hints.html.
