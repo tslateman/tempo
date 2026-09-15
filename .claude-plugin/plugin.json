@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Performance optimization workflow for Python/Django and TypeScript/Vue - estimate first, measure always. Based on Jeff Dean and Sanjay Ghemawat's Performance Hints.",
   "author": {
-    "name": "tslater"
+    "name": "Tommy Slater"
   },
   "license": "MIT",
   "keywords": [
